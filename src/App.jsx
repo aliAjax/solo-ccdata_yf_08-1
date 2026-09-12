@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   APP_ID, VERSION, STORE_KEY, SESSION_TAGS, PLACE_STATUS, LOOT_CATEGORIES, PALETTE,
-  uid, isValidDateStr, todayStr, loadCampaign, validateCampaign,
+  uid, isValidDateStr, todayStr, loadCampaign, validateCampaign, findDuplicateTitles,
   sortSessions, buildUsage, sessionMatches,
 } from './model.js';
 
@@ -171,7 +171,7 @@ const ChipPicker = ({ title, icon, items, selected, onToggle, dangling }) => (
   </fieldset>
 );
 
-function SessionModal({ initial, data, onSave, onClose }) {
+function SessionModal({ initial, data, existingTitles, onSave, onClose }) {
   const [form, setForm] = useState(() => initial || {
     title: '', date: todayStr(), tag: SESSION_TAGS[0], summary: '',
     color: PALETTE[0], characters: [], places: [], loots: [],
@@ -189,8 +189,12 @@ function SessionModal({ initial, data, onSave, onClose }) {
 
   const save = () => {
     const e = {};
+    // 提交前先去掉首尾空格，再做必填与唯一校验
     const title = form.title.trim();
     if (!title) e.title = '章节标题不能为空。';
+    else if (existingTitles.some((t) => t.trim() === title)) {
+      e.title = `章节标题「${title}」已存在，章节标题必须唯一。请换一个标题。`;
+    }
     if (!form.date) e.date = '请选择游戏日期。';
     else if (!isValidDateStr(form.date)) e.date = `日期「${form.date}」不合法，请使用有效的 YYYY-MM-DD。`;
     setErrors(e);
@@ -302,7 +306,7 @@ function EntityCards({ kind, data, usage, onEdit, onDelete }) {
 
 // ---------------- 时间线 ----------------
 
-function Timeline({ data, selectedId, onSelect, onNew, onEdit, onDelete, detailOpen, onCloseDetail }) {
+function Timeline({ data, selectedId, onSelect, onNew, onEdit, onDelete, detailOpen, onCloseDetail, dupTitleSet }) {
   const [q, setQ] = useState('');
   const [tag, setTag] = useState('全部');
   const [dir, setDir] = useState('asc');
@@ -365,7 +369,10 @@ function Timeline({ data, selectedId, onSelect, onNew, onEdit, onDelete, detailO
                   {i < filtered.length - 1 && <i />}
                 </div>
                 <div className="chapter-copy">
-                  <div className="tag">{s.tag}</div>
+                  <div className="tag-row">
+                    <div className="tag">{s.tag}</div>
+                    {dupTitleSet.has(s.title.trim()) && <span className="dup-badge" title="该标题与其他章节重复，请改名">标题重复</span>}
+                  </div>
                   <h3>{s.title}</h3>
                   <p>{s.summary || '（暂无摘要）'}</p>
                 </div>
@@ -375,6 +382,7 @@ function Timeline({ data, selectedId, onSelect, onNew, onEdit, onDelete, detailO
       </section>
 
       <DetailPanel data={data} session={cur} index={cur ? chronoIndex.get(cur.id) : null}
+        dupTitleSet={dupTitleSet}
         open={detailOpen} onClose={onCloseDetail} onEdit={onEdit} onDelete={onDelete} />
     </div>
   );
@@ -393,7 +401,7 @@ const RefChips = ({ label, items, names }) => (
   </div>
 );
 
-function DetailPanel({ data, session: cur, index, open, onClose, onEdit, onDelete }) {
+function DetailPanel({ data, session: cur, index, open, onClose, onEdit, onDelete, dupTitleSet }) {
   if (!cur) {
     return <section className={'detail-panel' + (open ? ' open' : '')}>
       <EmptyState icon="◌" title="选择一个章节"
@@ -418,6 +426,12 @@ function DetailPanel({ data, session: cur, index, open, onClose, onEdit, onDelet
       <div className="detail-body">
         <span className="tag">{cur.tag}</span>
         <h2>{cur.title}</h2>
+        {dupTitleSet.has(cur.title.trim()) && (
+          <div className="broken-banner dup-banner">
+            ⚠ 该标题与其他章节重复，章节标题必须唯一。请点击编辑改成不同标题。
+            <button className="link-btn light" onClick={() => onEdit(cur)}>去改名</button>
+          </div>
+        )}
         <p>{cur.summary || '这个章节还没有摘要，点击「编辑章节」补充剧情细节。'}</p>
         {broken > 0 && (
           <div className="broken-banner">
@@ -498,7 +512,17 @@ export default function App() {
   const [modal, setModal] = useState(null); // {type, ...}
   const [confirm, setConfirm] = useState(null);
   const [importResult, setImportResult] = useState(null);
-  const [banner, setBanner] = useState(initial.error ? { type: 'error', text: initial.error } : initial.info ? { type: 'info', text: initial.info } : null);
+  const [dismissedDupSig, setDismissedDupSig] = useState(null);
+  const [startupNote, setStartupNote] = useState(() => {
+    if (initial.error) return { type: 'error', text: initial.error };
+    const dupTitles = findDuplicateTitles(initial.data.sessions).map((g) => g.title);
+    const otherIssues = (initial.issues || []).filter(
+      (m) => !dupTitles.some((t) => m.includes(`「${t}」`) && m.includes('标题'))
+    );
+    if (initial.info) return { type: 'info', text: [initial.info, ...otherIssues].join(' ') };
+    if (otherIssues.length) return { type: 'warn', text: otherIssues.join(' ') };
+    return null;
+  });
   const fileRef = useRef(null);
   const toastTimer = useRef(null);
 
@@ -507,6 +531,10 @@ export default function App() {
   }, [data]);
 
   const usage = useMemo(() => buildUsage(data), [data]);
+
+  // 当前仍重复的标题组（实时；改名消除后横幅与标记自动消失）
+  const dupGroups = useMemo(() => findDuplicateTitles(data.sessions), [data.sessions]);
+  const dupTitleSet = useMemo(() => new Set(dupGroups.map((g) => g.title)), [dupGroups]);
 
   const notify = (text, type = 'ok') => {
     setToast({ text, type });
@@ -649,15 +677,35 @@ export default function App() {
           </div>
         </header>
 
-        {banner && (
-          <div className={`banner banner-${banner.type}`}>
-            {banner.text}
-            <button onClick={() => setBanner(null)} aria-label="关闭">×</button>
+        {startupNote && (
+          <div className={`banner banner-${startupNote.type}`}>
+            {startupNote.text}
+            <button onClick={() => setStartupNote(null)} aria-label="关闭">×</button>
           </div>
         )}
+        {dupGroups.length > 0 && (() => {
+          const sig = dupGroups.map((g) => g.ids.join(',')).sort().join('|');
+          if (dismissedDupSig === sig) return null;
+          return (
+            <div className="banner banner-warn">
+              <span>
+                检测到 {dupGroups.length} 组重复的章节标题：
+                {dupGroups.map((g) => `「${g.title}」×${g.ids.length}`).join('、')}
+                。所有 {data.sessions.length} 条章节均已完整保留，改名后冲突提示会自动消失。
+              </span>
+              {tab === 'timeline'
+                ? <button className="banner-action"
+                    onClick={() => setModal({ type: 'session', initial: data.sessions.find((s) => s.id === dupGroups[0].ids[0]) })}>
+                    去改名
+                  </button>
+                : <button className="banner-action" onClick={() => setTab('timeline')}>前往时间线处理</button>}
+              <button onClick={() => setDismissedDupSig(sig)} aria-label="关闭">×</button>
+            </div>
+          );
+        })()}
 
         {tab === 'timeline' && (
-          <Timeline data={data} selectedId={selectedId} detailOpen={detailOpen}
+          <Timeline data={data} selectedId={selectedId} detailOpen={detailOpen} dupTitleSet={dupTitleSet}
             onSelect={selectChapter} onCloseDetail={() => setDetailOpen(false)}
             onNew={() => setModal({ type: 'session' })}
             onEdit={(s) => setModal({ type: 'session', initial: s })}
@@ -682,7 +730,9 @@ export default function App() {
         onChange={(e) => { const f = e.target.files?.[0]; if (f) onFile(f); e.target.value = ''; }} />
 
       {modal?.type === 'session' && (
-        <SessionModal initial={modal.initial} data={data} onSave={saveSession} onClose={() => setModal(null)} />
+        <SessionModal initial={modal.initial} data={data}
+          existingTitles={data.sessions.filter((s) => s.id !== modal.initial?.id).map((s) => s.title)}
+          onSave={saveSession} onClose={() => setModal(null)} />
       )}
       {modal?.type === 'entity' && (
         <EntityModal kind={modal.kind} initial={modal.initial}

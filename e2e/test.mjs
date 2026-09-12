@@ -202,6 +202,56 @@ await t('删除章节', async () => {
   assert(await page.locator('.chapter').count() === 3, '应剩 3 章');
 });
 
+// ---------- 章节标题唯一：新建 / 编辑 ----------
+await t('新建章节：标题 trim 后与已有重复时表单内指出冲突且不能保存', async () => {
+  await page.getByRole('button', { name: /新建章节/ }).click();
+  await page.locator('.modal input').first().fill('  第一章：灰港的钟声  ');
+  await page.getByRole('button', { name: '保存章节' }).click();
+  await wait(50);
+  assert(await page.locator('.modal').count() === 1, '重名时弹窗不应关闭');
+  const err = await page.locator('.modal .field-error').first().textContent();
+  assert(err.includes('已存在') && err.includes('第一章：灰港的钟声'), '应在表单内指出冲突标题，实际：' + err);
+  assert(await page.locator('.chapter').count() === 3, '保存被阻止，章节数不应变化');
+  // 改成不同标题（仍带首尾空格）即可正常保存，保存的是 trim 后的标题
+  await page.locator('.modal input').first().fill('  临时唯一章  ');
+  await page.getByRole('button', { name: '保存章节' }).click();
+  await wait(60);
+  assert(await page.locator('.chapter', { hasText: '临时唯一章' }).count() === 1, '应保存 trim 后的新章节');
+  // 立刻删掉，保持后续用例的 3 章基线
+  await page.locator('.chapter', { hasText: '临时唯一章' }).click();
+  await page.getByRole('button', { name: '删除章节' }).first().click();
+  await page.getByRole('button', { name: '删除章节' }).last().click();
+  await wait(50);
+  assert(await page.locator('.chapter').count() === 3, '清理后应恢复 3 章');
+});
+
+await t('编辑章节：改成其他章节标题被阻止；保持原标题可保存；数据不变', async () => {
+  const first = page.locator('.chapter', { hasText: '灰港的钟声' });
+  await first.click();
+  await page.getByRole('button', { name: '编辑章节' }).click();
+  await wait(40);
+  const input = page.locator('.modal input').first();
+  await input.fill('第二章：雾中来客');
+  await page.getByRole('button', { name: '保存修改' }).click();
+  await wait(50);
+  assert(await page.locator('.modal').count() === 1, '与他人重名时弹窗不应关闭');
+  const err = await page.locator('.modal .field-error').first().textContent();
+  assert(err.includes('已存在'), '应指出标题冲突，实际：' + err);
+  await page.locator('.close').click();
+  await wait(40);
+  assert(await page.locator('.chapter', { hasText: '灰港的钟声' }).count() === 1, '原标题不应被改动');
+  assert(await page.locator('.chapter').count() === 3, '章节数不应变化');
+  // 保持自己原标题（仅加首尾空格）保存应当允许
+  await first.click();
+  await page.getByRole('button', { name: '编辑章节' }).click();
+  await wait(40);
+  await page.locator('.modal input').first().fill('  第一章：灰港的钟声  ');
+  await page.getByRole('button', { name: '保存修改' }).click();
+  await wait(50);
+  assert(await page.locator('.modal').count() === 0, '编辑自身标题（去空格后相同）应允许保存');
+  assert(await page.locator('.chapter', { hasText: '灰港的钟声' }).count() === 1, 'trim 后标题应保持');
+});
+
 // ---------- 刷新持久化 ----------
 await t('刷新后数据保留（伊琳·海风、月下集市仍在）', async () => {
   await page.reload();
@@ -254,6 +304,24 @@ await t('导入重名：失败', async () => {
   await importFile('/tmp/e2e-dup.json');
   assert(await page.locator('.import-errors li', { hasText: '重名' }).count() === 1, '应报重名');
   await page.getByRole('button', { name: '我知道了' }).click();
+});
+
+await t('导入重复章节标题：整体拒绝并逐组列出冲突，现有数据不变', async () => {
+  const j = JSON.parse(fs.readFileSync(roundPath, 'utf8'));
+  j.sessions[1].id = uid();
+  j.sessions[1].title = '  ' + j.sessions[0].title + '  '; // trim 后与第 1 条相同
+  fs.writeFileSync('/tmp/e2e-duptitle.json', JSON.stringify(j));
+  const before = await page.locator('.chapter').count();
+  await importFile('/tmp/e2e-duptitle.json');
+  const items = await page.locator('.import-errors li', { hasText: '章节标题' }).allInnerTexts();
+  const joined = items.join(' | ');
+  assert(items.length >= 1, '应列出重复标题冲突，实际：' + joined);
+  assert(joined.includes(j.sessions[0].title), '应指出冲突的标题文本，实际：' + joined);
+  assert(joined.includes('重复 2 次'), '应说明重复次数与位置，实际：' + joined);
+  await page.getByRole('button', { name: '我知道了' }).click();
+  assert(await page.locator('.chapter').count() === before, '拒绝导入后现有章节数不能变化');
+  // 确认弹窗里没有“确认导入”，数据未被替换
+  assert(await page.getByRole('button', { name: '确认导入' }).count() === 0, '失败时不应提供确认导入');
 });
 
 await t('导入非法日期：失败', async () => {
@@ -328,6 +396,67 @@ await t('旧版 campaign-log 数据可迁移并保留', async () => {
   assert(await page.locator('.banner-info').count() === 1, '应有迁移提示横幅');
   await page.getByRole('button', { name: '角色', exact: true }).click();
   assert(await page.locator('.char-card', { hasText: '旧角色' }).count() === 1, '旧角色未迁移');
+});
+
+// ---------- 本地存档已有重复标题：刷新保留全部并提示处理 ----------
+await t('本地已有重复标题：刷新后保留全部记录、出现冲突提示、改名后提示消失', async () => {
+  // 手工写入一份含重复标题（且带首尾空格差异）的合法本地存档
+  await page.evaluate(() => {
+    const base = {
+      app: 'campaigner-workbench', version: 1, name: '重复测试战役', system: 'D&D 5E',
+      characters: [], places: [], loots: [],
+    };
+    const sessions = [
+      { id: 'd1', date: '2024-03-01', title: '决战灰港', tag: '主线', color: '#d8a153', summary: '第一次', characters: [], places: [], loots: [] },
+      { id: 'd2', date: '2024-03-08', title: '  决战灰港  ', tag: '支线', color: '#93b7a6', summary: '重复标题', characters: [], places: [], loots: [] },
+      { id: 'd3', date: '2024-03-15', title: '归途', tag: '番外', color: '#b9a6d1', summary: '唯一标题', characters: [], places: [], loots: [] },
+    ];
+    localStorage.setItem('campaigner-workbench-v1', JSON.stringify({ ...base, sessions }));
+  });
+  await page.reload();
+  await page.waitForSelector('.chapter');
+  assert(await page.locator('.chapter').count() === 3, '刷新后三条章节必须全部保留，不能丢失');
+  assert(await page.locator('.chapter', { hasText: '决战灰港' }).count() === 2, '两条同名章节都应在时间线');
+  assert(await page.locator('.chapter', { hasText: '归途' }).count() === 1, '唯一章节应保留');
+  // 横幅提示冲突
+  assert(await page.locator('.banner-warn', { hasText: '重复的章节标题' }).count() === 1, '应出现重复标题提示横幅');
+  assert((await page.locator('.banner-warn').textContent()).includes('决战灰港'), '横幅应列出冲突标题');
+  // 时间线与详情上有重复标记
+  assert(await page.locator('.dup-badge').count() === 2, '两条重复章节都应有标记');
+  // 点横幅中的“去改名”打开第一条并改成唯一名（详情面板也有同名按钮，需限定到横幅）
+  await page.locator('.banner-warn .banner-action', { hasText: '去改名' }).click();
+  await wait(40);
+  assert(await page.locator('.modal').count() === 1, '应打开编辑弹窗');
+  await page.locator('.modal input').first().fill('决战灰港（上）');
+  await page.getByRole('button', { name: '保存修改' }).click();
+  await wait(60);
+  assert(await page.locator('.banner-warn').count() === 0, '冲突消除后横幅应消失');
+  assert(await page.locator('.dup-badge').count() === 0, '重复标记应消失');
+  assert(await page.locator('.chapter').count() === 3, '记录数量仍为 3，无覆盖无丢失');
+  // 刷新后改名结果保留、不再提示
+  await page.reload();
+  await page.waitForSelector('.chapter');
+  assert(await page.locator('.chapter', { hasText: '决战灰港（上）' }).count() === 1, '改名应持久化');
+  assert(await page.locator('.banner-warn').count() === 0, '刷新后不应再提示重复');
+});
+
+// ---------- 旧版数据自带重复标题：迁移时同样保留并提示 ----------
+await t('旧版数据含重复章节标题：迁移保留全部并提示处理', async () => {
+  await page.evaluate(() => localStorage.clear());
+  await page.evaluate(() => localStorage.setItem('campaign-log', JSON.stringify({
+    name: '旧重复战役', system: 'COC',
+    sessions: [
+      { id: 1, date: '2024-01-01', title: '序章：来客', summary: 'a', tag: '主线', color: '#123456' },
+      { id: 2, date: '2024-01-08', title: '序章：来客', summary: 'b', tag: '支线', color: '#654321' },
+    ],
+    characters: [],
+  })));
+  await page.goto(BASE);
+  await page.waitForSelector('.chapter');
+  assert(await page.locator('.chapter').count() === 2, '旧版两条同名章节都应迁移保留');
+  assert(await page.locator('.banner-warn', { hasText: '重复的章节标题' }).count() === 1, '应提示重复标题');
+  assert((await page.locator('.banner-warn').textContent()).includes('序章：来客'), '应列出冲突标题');
+  assert(await page.locator('.banner-info', { hasText: '迁移' }).count() === 1, '同时应保留迁移说明');
 });
 
 // ---------- 窄屏 390x844 真实操作 ----------

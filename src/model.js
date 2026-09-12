@@ -108,12 +108,34 @@ export function migrateLegacy(old) {
 
 // ---------- 导入校验：严格失败，成功才返回规范化数据 ----------
 
-const LABELS = { character: '角色', place: '地点', loot: '战利品', session: '章节' };
+// 找出 trim 后重复的章节标题，返回 [{title, ids[], indexes[]}]（index 为 1 起）
+export function findDuplicateTitles(sessions) {
+  const m = new Map();
+  sessions.forEach((s, i) => {
+    const title = typeof s?.title === 'string' ? s.title.trim() : '';
+    if (!title) return;
+    if (!m.has(title)) m.set(title, []);
+    m.get(title).push({ id: s.id, index: i + 1 });
+  });
+  return [...m]
+    .filter(([, entries]) => entries.length > 1)
+    .map(([title, entries]) => ({ title, ids: entries.map((e) => e.id), indexes: entries.map((e) => e.index) }));
+}
 
-export function validateCampaign(raw) {
+const duplicateTitleErrors = (sessions) =>
+  findDuplicateTitles(sessions).map(
+    (g) => `章节标题「${g.title}」重复 ${g.ids.length} 次（${g.indexes.map((n) => `第 ${n} 条`).join('、')}），章节标题必须唯一。`
+  );
+
+// 严格模式（导入）：任何语义问题都进 errors 并整体拒绝。
+// 宽松模式（本地加载）：结构性错误仍失败；语义问题尽力修复/原样保留，进 issues 供 UI 提示。
+export function validateCampaign(raw, { relaxed = false } = {}) {
   const errors = [];
   const warnings = [];
-  const fail = () => ({ ok: false, data: null, errors, warnings });
+  const issues = [];
+  const fail = () => ({ ok: false, data: null, errors, warnings, issues: [] });
+  // 语义问题的去处：严格 → errors（拒绝导入）；宽松 → issues（加载后提示）
+  const sem = relaxed ? issues : errors;
 
   if (!isObj(raw)) {
     errors.push('文件内容不是有效的 JSON 对象。');
@@ -140,34 +162,34 @@ export function validateCampaign(raw) {
   if (errors.length) return fail();
 
   const checkId = (item, label, seen) => {
-    if (typeof item.id !== 'string' || !item.id.trim()) {
-      errors.push(`${label}缺少 id 字段。`);
+    const rawId = typeof item.id === 'string' ? item.id.trim() : '';
+    if (!rawId) {
+      sem.push(`${label}缺少 id 字段${relaxed ? '，已自动补 id。' : '。'}`);
+      if (relaxed) { const id = uid(); seen.add(id); return id; }
       return null;
     }
-    const id = item.id.trim();
-    if (seen.has(id)) {
-      errors.push(`${label}的 id「${id}」重复，每个条目必须唯一。`);
+    if (seen.has(rawId)) {
+      sem.push(`${label}的 id「${rawId}」重复${relaxed ? '，已为后者分配新 id。' : '，每个条目必须唯一。'}`);
+      if (relaxed) { const id = uid(); seen.add(id); return id; }
       return null;
     }
-    seen.add(id);
-    return id;
+    seen.add(rawId);
+    return rawId;
   };
-  const checkName = (item, label, seen) => {
+  const checkName = (kindName, item, label, seen, fallback) => {
     const name = typeof item.name === 'string' ? item.name.trim() : '';
     if (!name) {
-      errors.push(`${label}的名称为空。`);
-      return null;
+      sem.push(`${label}的名称为空${relaxed ? `，已临时命名为「${fallback}」，请尽快修改。` : '。'}`);
+      return relaxed ? fallback : null;
     }
-    if (seen.has(name)) errors.push(`${LABELS[item.__kind] || '条目'}存在重名「${name}」，同类型名称必须唯一。`);
+    if (seen.has(name)) sem.push(`${kindName}存在重名「${name}」，同类型名称必须唯一。`);
     seen.add(name);
     return name;
   };
-  const enumCheck = (value, allowed, label) => {
-    if (!allowed.includes(value)) {
-      errors.push(`${label}取值无效「${value}」，允许：${allowed.join(' / ')}。`);
-      return false;
-    }
-    return true;
+  const enumOr = (value, allowed, label, fallback) => {
+    if (allowed.includes(value)) return value;
+    sem.push(`${label}取值无效「${value}」${relaxed ? `，已回退为「${fallback}」。` : `，允许：${allowed.join(' / ')}。`}`);
+    return relaxed ? fallback : value;
   };
 
   // 角色
@@ -176,9 +198,9 @@ export function validateCampaign(raw) {
   const cNames = new Set();
   raw.characters.forEach((item, i) => {
     const label = isObj(item) && item.name ? `角色「${item.name}」` : `角色第 ${i + 1} 项`;
-    if (!isObj(item)) return errors.push(`${label}不是对象。`);
+    if (!isObj(item)) return sem.push(`${label}不是对象${relaxed ? '，无法读取，已跳过。' : '。'}`);
     const id = checkId(item, label, cIds);
-    const name = checkName({ ...item, __kind: 'character' }, label, cNames);
+    const name = checkName('角色', item, label, cNames, '未命名角色');
     if (!id || !name) return;
     let color = typeof item.color === 'string' ? item.color.trim() : '';
     if (!HEX_COLOR.test(color)) {
@@ -194,12 +216,11 @@ export function validateCampaign(raw) {
   const pNames = new Set();
   raw.places.forEach((item, i) => {
     const label = isObj(item) && item.name ? `地点「${item.name}」` : `地点第 ${i + 1} 项`;
-    if (!isObj(item)) return errors.push(`${label}不是对象。`);
+    if (!isObj(item)) return sem.push(`${label}不是对象${relaxed ? '，无法读取，已跳过。' : '。'}`);
     const id = checkId(item, label, pIds);
-    const name = checkName({ ...item, __kind: 'place' }, label, pNames);
+    const name = checkName('地点', item, label, pNames, '未命名地点');
     if (!id || !name) return;
-    const status = str(item.status);
-    enumCheck(status, PLACE_STATUS, `${label}的状态`);
+    const status = enumOr(str(item.status), PLACE_STATUS, `${label}的状态`, PLACE_STATUS[1]);
     places.push({ id, name, status, region: str(item.region), note: str(item.note) });
   });
 
@@ -209,72 +230,82 @@ export function validateCampaign(raw) {
   const lNames = new Set();
   raw.loots.forEach((item, i) => {
     const label = isObj(item) && item.name ? `战利品「${item.name}」` : `战利品第 ${i + 1} 项`;
-    if (!isObj(item)) return errors.push(`${label}不是对象。`);
+    if (!isObj(item)) return sem.push(`${label}不是对象${relaxed ? '，无法读取，已跳过。' : '。'}`);
     const id = checkId(item, label, lIds);
-    const name = checkName({ ...item, __kind: 'loot' }, label, lNames);
+    const name = checkName('战利品', item, label, lNames, '未命名战利品');
     if (!id || !name) return;
-    if (!Number.isInteger(item.qty) || item.qty < 1) {
-      errors.push(`${label}的数量 qty「${item.qty}」无效，必须为大于 0 的整数。`);
+    let qty = item.qty;
+    if (!Number.isInteger(qty) || qty < 1) {
+      sem.push(`${label}的数量 qty「${qty}」无效${relaxed ? '，已按 1 处理。' : '，必须为大于 0 的整数。'}`);
+      qty = relaxed ? 1 : qty;
     }
-    const category = str(item.category);
-    enumCheck(category, LOOT_CATEGORIES, `${label}的类别`);
-    loots.push({ id, name, qty: item.qty, category, note: str(item.note) });
+    const category = enumOr(str(item.category), LOOT_CATEGORIES, `${label}的类别`, LOOT_CATEGORIES[0]);
+    loots.push({ id, name, qty, category, note: str(item.note) });
   });
 
-  if (errors.length) return fail();
+  if (!relaxed && errors.length) return fail();
 
-  // 章节（引用必须可解析，否则整份导入失败，不做静默丢弃）
+  // 章节（引用必须可解析，否则整份导入失败，不做静默丢弃；宽松模式保留失效 id 供用户清理）
   const sessions = [];
   const sIds = new Set();
   const refCheck = (arr, ids, label, allowedLabel) => {
     if (!Array.isArray(arr)) {
-      errors.push(`${label}不是数组（应为${allowedLabel} id 列表）。`);
+      sem.push(`${label}的关联不是数组${relaxed ? '，已清空。' : `（应为${allowedLabel} id 列表）。`}`);
       return [];
     }
-    return arr.filter((rid) => {
+    return arr.flatMap((rid) => {
       if (typeof rid !== 'string' || !rid.trim()) {
-        errors.push(`${label}中存在非字符串 id。`);
-        return false;
+        sem.push(`${label}中存在非字符串 id${relaxed ? '，已移除。' : '。'}`);
+        return [];
       }
       if (!ids.has(rid)) {
-        errors.push(`${label}引用了不存在的${allowedLabel} id「${rid}」（关联已失效）。`);
-        return false;
+        sem.push(`${label}引用了不存在的${allowedLabel} id「${rid}」（关联已失效）${relaxed ? '，请在该章节中清理。' : '。'}`);
+        return relaxed ? [rid] : []; // 宽松：保留失效标记，由用户在表单中清理
       }
-      return true;
+      return [rid];
     });
   };
   raw.sessions.forEach((item, i) => {
-    const title = typeof item.title === 'string' ? item.title.trim() : '';
-    const label = title ? `章节「${title}」` : `章节第 ${i + 1} 项`;
-    if (!isObj(item)) return errors.push(`${label}不是对象。`);
+    const rawTitle = typeof item?.title === 'string' ? item.title.trim() : '';
+    const label = rawTitle ? `章节「${rawTitle}」` : `章节第 ${i + 1} 项`;
+    if (!isObj(item)) return sem.push(`${label}不是对象${relaxed ? '，无法读取，已跳过。' : '。'}`);
     const id = checkId(item, label, sIds);
-    if (!title) errors.push(`${label}的标题为空。`);
-    if (!isValidDateStr(item.date)) {
-      errors.push(`${label}的日期「${item.date}」无效，必须为合法的 YYYY-MM-DD。`);
+    let title = rawTitle;
+    if (!title) {
+      sem.push(`${label}的标题为空${relaxed ? '，已临时命名为「未命名章节」。' : '。'}`);
+      if (!relaxed) title = '';
+      else title = '未命名章节';
     }
-    const tag = str(item.tag);
-    enumCheck(tag, SESSION_TAGS, `${label}的类型`);
-    const summary = str(item.summary);
+    let date = item.date;
+    if (!isValidDateStr(date)) {
+      sem.push(`${label}的日期「${date}」无效，必须为合法的 YYYY-MM-DD${relaxed ? '，日期已留空待补。' : '。'}`);
+      if (relaxed) date = '';
+    }
+    const tag = enumOr(str(item.tag), SESSION_TAGS, `${label}的类型`, SESSION_TAGS[0]);
     const refs = {
       characters: refCheck(item.characters, cIds, label, '角色'),
       places: refCheck(item.places, pIds, label, '地点'),
       loots: refCheck(item.loots, lIds, label, '战利品'),
     };
-    if (!id || !title || !isValidDateStr(item.date)) return;
+    if (!relaxed && (!id || !title || !isValidDateStr(item.date))) return;
     let color = typeof item.color === 'string' ? item.color.trim() : '';
     if (!HEX_COLOR.test(color)) {
       warnings.push(`章节「${title}」的颜色缺失或非法，已自动分配颜色。`);
       color = PALETTE[sessions.length % PALETTE.length];
     }
-    sessions.push({ id, title, date: item.date, tag, summary, color, ...refs });
+    sessions.push({ id: id || uid(), title, date, tag, summary: str(item.summary), color, ...refs });
   });
 
-  if (errors.length) return fail();
+  // 章节标题唯一性：重复时逐组列出冲突位置
+  for (const msg of duplicateTitleErrors(sessions)) sem.push(msg);
+
+  if (!relaxed && errors.length) return fail();
 
   return {
     ok: true,
     errors: [],
     warnings,
+    issues,
     data: {
       app: APP_ID, version: VERSION,
       name: raw.name.trim(), system: raw.system.trim(),
@@ -291,12 +322,14 @@ export function loadCampaign() {
     if (raw) {
       let parsed = null;
       try { parsed = JSON.parse(raw); } catch { parsed = null; }
-      const res = parsed && validateCampaign(parsed);
-      if (res && res.ok) return { data: res.data };
+      // 本地存档走宽松模式：尽量保留全部记录，问题交给用户在界面处理
+      const res = parsed && validateCampaign(parsed, { relaxed: true });
+      if (res && res.ok) return { data: res.data, issues: res.issues, warnings: res.warnings };
+      // 仅结构性损坏（JSON 损坏 / 缺集合 / 版本不符）才备份并载入示例
       try { localStorage.setItem(CORRUPT_KEY, raw); } catch { /* 忽略 */ }
       return {
         data: seedCampaign(),
-        error: '本地存档解析或校验失败，已保留原数据到损坏备份键，并临时载入示例数据。',
+        error: '本地存档结构损坏或格式不受支持，已保留原数据到损坏备份键，并临时载入示例数据。',
       };
     }
     const legacy = localStorage.getItem(LEGACY_KEY);
@@ -304,10 +337,13 @@ export function loadCampaign() {
       try {
         const old = JSON.parse(legacy);
         if (isObj(old) && Array.isArray(old.sessions)) {
-          return {
-            data: migrateLegacy(old),
-            info: '已从旧版战役记录迁移数据，可在章节中补充参与者、地点与收获关联。',
-          };
+          const migrated = migrateLegacy(old);
+          // 迁移结果再走一遍宽松校验，把重复标题等问题提示出来
+          const res = validateCampaign(migrated, { relaxed: true });
+          const info = '已从旧版战役记录迁移数据，可在章节中补充参与者、地点与收获关联。';
+          return res.ok
+            ? { data: res.data, info, issues: res.issues }
+            : { data: migrated, info };
         }
       } catch { /* 旧档损坏则落到示例数据 */ }
     }
